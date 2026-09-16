@@ -217,7 +217,7 @@ uint64_t shift_or_search(const search_params_t *params, const char *text_start, 
 uint64_t two_way_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);      // v2.4: Two-Way algorithm
 
 // SIMD functions (only declared if supported by compiler flags)
-#if defined(__SSE4_2__)
+#if defined(__SSE2__)
 uint64_t simd_sse42_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 #endif
 

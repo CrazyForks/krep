@@ -5,7 +5,7 @@ A high-performance string search utility for the command line. Fast, multi-threa
 ## Features
 
 - Smart algorithm selection (Boyer-Moore, KMP, Two-Way, Shift-Or, Aho-Corasick)
-- SIMD acceleration (SSE4.2, AVX2, NEON) and memory-mapped I/O
+- SIMD acceleration (SSE2, AVX2, AVX-512, NEON) and memory-mapped I/O
 - Multi-threaded search across CPU cores
 - POSIX regular expressions and multiple pattern search
 - Recursive directory search with globs, exclusions, and `.gitignore` support
@@ -27,6 +27,8 @@ sudo make install
 ```
 
 Requirements: GCC or compatible C compiler, POSIX system (Linux, macOS, BSD), pthread.
+
+Use `make PORTABLE=1` for distributable binaries, or `make NATIVE=1` to tune a build for your own CPU. Run `make clean` before changing build flags. Published Linux x86-64 binaries use baseline SSE2; source builds can enable wider vectors supported by the build machine.
 
 ## Usage
 
@@ -80,6 +82,20 @@ echo 'pattern' | krep -f - target.txt         # patterns from stdin
 - `--color[=WHEN]` Color control (`always`, `never`, `auto`)
 - `--no-simd` Disable SIMD
 - `-v, --version`, `-h, --help`
+
+## Performance and testing
+
+Version 3.1.0 adds two-byte SIMD filtering for literals, linear-time line numbering and JSON output, and early exit for existence checks. Measurements against 3.0.2, including hardware, raw samples and limitations, are in [the performance report](docs/performance-3.1.0.md).
+
+```bash
+make ci             # unit, protected-page, directory and CLI tests (Python 3 required)
+make sanitize       # rebuild and test with ASan + UBSan (Clang required)
+make clean && make  # restore an optimized build after sanitizer testing
+make bench-release  # generated local dataset; no download required
+python3 test/benchmark_release.py --baseline /path/to/krep-3.0.2 --runs 5
+```
+
+`--stats` reports matches encountered; `-q`, `-l` and `-L` stop after the first match, so their match totals are intentionally capped at one per searched file. Input byte totals describe the supplied file or buffer sizes, not physical I/O. Stdin is buffered before searching.
 
 ## Contributing
 

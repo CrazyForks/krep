@@ -4,45 +4,48 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
+        include:
+          - os: ubuntu-latest
+            portable: 0
+          - os: ubuntu-latest
+            portable: 1
+          - os: macos-latest
+            portable: 0
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Show toolchain
-        run: |
-          cc --version || true
-          make --version || true
-      - name: Build
-        run: make -j
-      - name: Run Unit Tests
-        run: make test
-      - name: Run Directory Integration Tests
-        run: make test-directory
-      - name: Run CLI Integration Tests
-        run: make test-cli
-      - name: Ensure ripgrep is available
-        if: matrix.os == 'ubuntu-latest'
+        run: cc --version
+      - name: Build and run all tests
+        run: make -j2 PORTABLE=${{ matrix.portable }} ci
+      - name: Offline benchmark smoke test
+        run: python3 test/benchmark_release.py --runs 1 --size-mib 2 --output-lines 128
+      - name: Test AVX2 when supported by the runner
+        if: matrix.os == 'ubuntu-latest' && matrix.portable == 0
         shell: bash
         run: |
-          if command -v rg >/dev/null 2>&1; then
-            exit 0
+          if grep -qw avx2 /proc/cpuinfo; then
+            make clean
+            make -j2 ci CFLAGS='-Wall -Wextra -O3 -std=c11 -pthread -D_GNU_SOURCE -D_DEFAULT_SOURCE -mavx2' LDFLAGS='-pthread'
           fi
 
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
-      - name: Benchmark smoke test
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          curl -LO 'https://burntsushi.net/stuff/subtitles2016-sample.en.gz'
-          gzip -dkf subtitles2016-sample.en.gz
-          RUNS=1 bash test/benchmark_krep_vs_rg.sh Sherlock
+  sanitizers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: AddressSanitizer and UndefinedBehaviorSanitizer
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: make sanitize

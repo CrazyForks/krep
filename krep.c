@@ -42,7 +42,6 @@ static bool is_repetitive_pattern(const char *pattern, size_t pattern_len);
 static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr, size_t current_pos, size_t needed);
 // Submit multiple tasks in one lock/unlock roundtrip.
 static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *), void **args, int count);
-static size_t line_number_at_offset(const char *text, size_t offset);
 double get_time(void);
 
 // SIMD Intrinsics Includes based on compiler flags (from Makefile)
@@ -61,8 +60,8 @@ double get_time(void);
 #define KREP_USE_AVX2 0
 #endif
 
-#if defined(__SSE4_2__) && !KREP_USE_AVX2
-#include <nmmintrin.h> // SSE4.2 intrinsics
+#if defined(__SSE2__) && !KREP_USE_AVX2
+#include <emmintrin.h> // Bounded pair filtering only requires baseline SSE2
 #define KREP_USE_SSE42 1
 #elif !defined(KREP_USE_SSE42)
 #define KREP_USE_SSE42 0
@@ -82,7 +81,7 @@ double get_time(void);
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "3.0.2"
+#define VERSION "3.1.0"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -100,18 +99,9 @@ double get_time(void);
 #define HOT_FUNCTION __attribute__((hot))
 #define CACHE_ALIGNED __attribute__((aligned(CACHE_LINE_SIZE)))
 
-// Determine max pattern length usable by SIMD based on highest available instruction set
-// NOTE: Current SIMD implementations only support case-sensitive search.
-#if KREP_USE_AVX512
-// AVX-512 implementation handles <= 64 bytes.
+// Pair filtering supports literals up to 64 bytes on every SIMD backend.
+#if KREP_USE_AVX512 || KREP_USE_AVX2 || KREP_USE_SSE42 || KREP_USE_NEON
 const size_t SIMD_MAX_PATTERN_LEN = 64;
-#elif KREP_USE_AVX2
-// AVX2 implementation handles <= 32 bytes.
-const size_t SIMD_MAX_PATTERN_LEN = 32;
-#elif KREP_USE_SSE42
-const size_t SIMD_MAX_PATTERN_LEN = 16;
-#elif KREP_USE_NEON
-const size_t SIMD_MAX_PATTERN_LEN = 16;
 #else
 const size_t SIMD_MAX_PATTERN_LEN = 0;
 #endif
@@ -553,10 +543,18 @@ static void json_write_escaped(FILE *out, const char *data, size_t len)
     fputc('"', out);
 }
 
-static size_t line_number_at_offset(const char *text, size_t offset)
+typedef struct
 {
-    size_t line_number = 1;
-    const char *scan = text;
+    size_t offset;
+    size_t line_start;
+    size_t line_number;
+} line_cursor_t;
+
+// Sorted matches and output lines only move forward. Scan each byte at most
+// once instead of recounting all preceding newlines for every output record.
+static size_t advance_line_cursor(line_cursor_t *cursor, const char *text, size_t offset)
+{
+    const char *scan = text + cursor->offset;
     const char *end = text + offset;
 
     while (scan < end)
@@ -564,11 +562,13 @@ static size_t line_number_at_offset(const char *text, size_t offset)
         const void *newline = memchr(scan, '\n', (size_t)(end - scan));
         if (!newline)
             break;
-        line_number++;
+        cursor->line_number++;
         scan = (const char *)newline + 1;
+        cursor->line_start = (size_t)(scan - text);
     }
 
-    return line_number;
+    cursor->offset = offset;
+    return cursor->line_number;
 }
 
 static size_t previous_line_start(const char *text, size_t line_start)
@@ -577,9 +577,6 @@ static size_t previous_line_start(const char *text, size_t line_start)
         return 0;
 
     size_t pos = line_start - 1;
-    if (pos > 0 && text[pos] == '\n')
-        pos--;
-
     while (pos > 0 && text[pos - 1] != '\n')
         pos--;
 
@@ -827,6 +824,7 @@ static printable_line_t *build_printable_lines(const char *text,
     size_t count = 0;
     size_t capacity = 0;
     size_t last_line_start = SIZE_MAX;
+    line_cursor_t cursor = {.line_number = 1};
 
     for (uint64_t i = 0; i < result->count; ++i)
     {
@@ -834,7 +832,8 @@ static printable_line_t *build_printable_lines(const char *text,
         if (match_start >= text_len)
             continue;
 
-        size_t line_start = find_line_start(text, text_len, match_start);
+        advance_line_cursor(&cursor, text, match_start);
+        size_t line_start = cursor.line_start;
         if (line_start == last_line_start && count > 0)
         {
             lines[count - 1].match_count++;
@@ -846,8 +845,8 @@ static printable_line_t *build_printable_lines(const char *text,
 
         printable_line_t line = {
             .start = line_start,
-            .end = find_line_end(text, text_len, line_start),
-            .line_number = line_number_at_offset(text, line_start),
+            .end = find_line_end(text, text_len, match_start),
+            .line_number = cursor.line_number,
             .first_match_index = i,
             .match_count = 1};
 
@@ -896,6 +895,7 @@ static size_t print_contextual_matching_items(const char *filename,
     size_t last_output_next_start = 0;
     bool emitted_any_line = false;
     size_t next_match_line = 0;
+    line_cursor_t cursor = {.line_number = 1};
     match_position_t line_matches[2048];
 
     for (size_t i = 0; i < printable_count;)
@@ -938,7 +938,7 @@ static size_t print_contextual_matching_items(const char *filename,
                                          text,
                                          line_start,
                                          line_end,
-                                         line_number_at_offset(text, line_start),
+                                         advance_line_cursor(&cursor, text, line_start),
                                          line_matches,
                                          match_count,
                                          !is_match_line);
@@ -970,6 +970,7 @@ static size_t print_json_matching_items(const char *filename,
     if (only_matching)
     {
         size_t items_printed = 0;
+        line_cursor_t cursor = {.line_number = 1};
         for (uint64_t i = 0; i < result->count; ++i)
         {
             if (params->max_count != SIZE_MAX && items_printed >= params->max_count)
@@ -982,7 +983,8 @@ static size_t print_json_matching_items(const char *filename,
             if (end > text_len)
                 end = text_len;
 
-            size_t line_start = find_line_start(text, text_len, start);
+            advance_line_cursor(&cursor, text, start);
+            size_t line_start = cursor.line_start;
             fputs("{\"type\":\"match\"", stdout);
             if (filename)
             {
@@ -990,7 +992,7 @@ static size_t print_json_matching_items(const char *filename,
                 json_write_escaped(stdout, filename, strlen(filename));
             }
             printf(",\"line_number\":%zu,\"byte_start\":%zu,\"byte_end\":%zu,\"column_start\":%zu,\"column_end\":%zu,\"match\":",
-                   line_number_at_offset(text, start),
+                   cursor.line_number,
                    start,
                    end,
                    start - line_start + 1,
@@ -2811,50 +2813,26 @@ search_func_t select_search_algorithm(const search_params_t *params)
         return memchr_search;
     }
 
-    // 2) BNDM (Shift-Or) for patterns 2–8 bytes.
-    //    Bit-parallel search is exceptionally fast on modern CPUs and
-    //    often beats both BMH and SIMD for very short patterns.
-    if (params->pattern_len >= 2 && params->pattern_len <= 8)
-    {
-        // For line-counting workloads on very short literals (2-3 bytes),
-        // the scalar memchr-based path can skip an entire line with less
-        // overhead than building bit-masks.
-        if (params->pattern_len <= 3 && params->count_lines_mode)
-            return memchr_short_search;
-
-        // For case-insensitive patterns 2–3 bytes, memchr_short_search
-        // has a well-tuned hand-rolled inner loop.
-        if (params->pattern_len <= 3 && !params->case_sensitive)
-            return memchr_short_search;
-
-        // Otherwise: BNDM (Shift-Or) for 2–8 byte case-sensitive,
-        // or case-insensitive patterns of length 4–8.
-        return shift_or_search;
-    }
-
-    // 3) For patterns 9+ bytes, prefer SIMD when available
-    if (can_use_simd && params->case_sensitive)
+    // Pair filtering amortizes verification across a full vector of starts.
+    if (can_use_simd && params->case_sensitive && params->pattern_len >= 2)
     {
 #if KREP_USE_AVX512
-        if (params->pattern_len <= 64)
-            return simd_avx512_search;
-#endif
-#if KREP_USE_AVX2
-        if (params->pattern_len <= 32)
-            return simd_avx2_search;
-#endif
-#if KREP_USE_SSE42
-        if (params->pattern_len <= 16)
-            return simd_sse42_search;
-#endif
-#if KREP_USE_NEON
+        return simd_avx512_search;
+#elif KREP_USE_AVX2
+        return simd_avx2_search;
+#elif KREP_USE_SSE42
+        return simd_sse42_search;
+#elif KREP_USE_NEON
         return neon_search;
 #endif
-    } else if (can_use_simd && !params->case_sensitive) {
-#if KREP_USE_AVX2
-        if (params->pattern_len <= 32)
-            return simd_avx2_search;
-#endif
+    }
+
+    // Scalar and case-insensitive short-pattern paths.
+    if (params->pattern_len >= 2 && params->pattern_len <= 8)
+    {
+        if (params->pattern_len <= 3 && (params->count_lines_mode || !params->case_sensitive))
+            return memchr_short_search;
+        return shift_or_search;
     }
 
     // 4) Two-Way algorithm for the general scalar fallback.
@@ -2984,7 +2962,7 @@ const char *get_algorithm_name(search_func_t func)
         return "Two-Way";
 #if KREP_USE_SSE42
     else if (func == simd_sse42_search)
-        return "SSE4.2";
+        return "SSE2 pair filter";
 #endif
 #if KREP_USE_AVX2
     else if (func == simd_avx2_search)
@@ -3015,6 +2993,9 @@ int search_string(const search_params_t *params, const char *text)
     bool regex_compiled = false;
     search_params_t current_params = *params; // Make a mutable copy
     ac_trie_t *local_ac_trie = NULL;          // Pointer for locally built trie
+
+    if ((quiet_mode || files_with_matches_mode || files_without_match_mode) && current_params.max_count > 1)
+        current_params.max_count = 1;
 
     // --- Validation ---
     if (current_params.num_patterns == 0)
@@ -3053,6 +3034,14 @@ int search_string(const search_params_t *params, const char *text)
                 return 2;
             }
         }
+    }
+
+    if (current_params.max_count == 0)
+    {
+        if (current_params.count_lines_mode || current_params.count_matches_mode)
+            print_count_result(NULL, 0);
+        record_search_stats(text_len, 0, 1);
+        return 1;
     }
 
     // --- Resource Allocation ---
@@ -3190,7 +3179,7 @@ int search_string(const search_params_t *params, const char *text)
         matches->count = max_count;
     }
 
-    if (current_params.count_lines_mode || current_params.count_matches_mode)
+    if (current_params.count_lines_mode || current_params.count_matches_mode || !current_params.track_positions)
     {
         match_found = (final_count > 0);
     }
@@ -3216,7 +3205,9 @@ int search_string(const search_params_t *params, const char *text)
         // Print matches/lines if found
         if (result_code == 0 && matches)
         {
-            // No need to sort for string search (single thread)
+            // Aho-Corasick emits by end offset, which can differ from start order.
+            if (current_params.num_patterns > 1 && matches->count > 1)
+                qsort(matches->positions, matches->count, sizeof(match_position_t), compare_match_positions);
             print_matching_items(NULL, text, text_len, matches, &current_params); // Pass params
         }
         // Handle case where match was found but no positions recorded (e.g., empty regex match)
@@ -3288,6 +3279,9 @@ static void KREP_UNUSED cleanup_global_thread_pool()
 int search_file(const search_params_t *params, const char *filename, int requested_thread_count)
 {
     search_params_t current_params = *params;
+    const bool existence_only = quiet_mode || files_with_matches_mode || files_without_match_mode;
+    if (existence_only && current_params.max_count > 1)
+        current_params.max_count = 1;
     ac_trie_t *local_ac_trie = NULL; // Pointer for locally built trie
 
     int result_code = 1;                         // Default: no match found
@@ -3434,6 +3428,16 @@ int search_file(const search_params_t *params, const char *filename, int request
         return 2;
     }
     file_size = (size_t)file_stat.st_size;
+
+    if (current_params.max_count == 0)
+    {
+        close(fd);
+        if (current_params.count_lines_mode || current_params.count_matches_mode)
+            print_count_result(filename, 0);
+        print_file_list_result(filename, 1);
+        record_search_stats(0, 0, 1);
+        return 1;
+    }
 
     // --- Handle Empty File ---
     if (file_size == 0)
@@ -3720,7 +3724,7 @@ int search_file(const search_params_t *params, const char *filename, int request
 
 #ifdef MAP_POPULATE
         // Try with MAP_POPULATE first
-        int mmap_flags_populate = mmap_base_flags | MAP_POPULATE;
+        int mmap_flags_populate = mmap_base_flags | (existence_only ? 0 : MAP_POPULATE);
         file_data = mmap(NULL, file_size, PROT_READ, mmap_flags_populate, fd, 0);
 
         // If MAP_POPULATE failed, try without it
@@ -3753,7 +3757,8 @@ int search_file(const search_params_t *params, const char *filename, int request
         }
 
         // Advise the kernel about expected access pattern
-        int madvise_ret = madvise(file_data, file_size, MADV_SEQUENTIAL | MADV_WILLNEED);
+        int madvise_ret = madvise(file_data, file_size,
+                                 existence_only ? MADV_NORMAL : MADV_SEQUENTIAL | MADV_WILLNEED);
         if (madvise_ret != 0)
         {
             int madvise_err = errno;
@@ -3795,6 +3800,17 @@ int search_file(const search_params_t *params, const char *filename, int request
     }
     if (actual_thread_count <= 0)
         actual_thread_count = 1;
+    // Existence checks finish at the first match without starting other workers.
+    if (existence_only)
+        actual_thread_count = 1;
+    // Word boundaries and non-overlapping output need complete lines. A literal
+    // containing a newline cannot use those boundaries, so keep it in one chunk.
+    if (!current_params.use_regex && (current_params.whole_word || only_matching))
+    {
+        for (size_t i = 0; i < current_params.num_patterns; ++i)
+            if (memchr(current_params.patterns[i], '\n', current_params.pattern_lens[i]))
+                actual_thread_count = 1;
+    }
 
     // Determine how many threads to use based on file size and available cores
     int available_cores = requested_thread_count > 0 ? requested_thread_count : sysconf(_SC_NPROCESSORS_ONLN);
@@ -3881,7 +3897,8 @@ int search_file(const search_params_t *params, const char *filename, int request
         // For simplicity, we assume initial allocation was sufficient or handle errors later.
     }
 
-    const bool line_aligned_chunks = current_params.count_lines_mode;
+    const bool line_aligned_chunks = current_params.count_lines_mode ||
+                                     current_params.whole_word || only_matching;
     size_t current_pos = 0;
     int chunks_launched = 0;
     const int planned_thread_count = actual_thread_count;
@@ -3917,10 +3934,8 @@ int search_file(const search_params_t *params, const char *filename, int request
         size_t effective_chunk_len = 0;
         if (line_aligned_chunks)
         {
-            // For -c workloads, split the file on line boundaries so that each line
-            // is processed by exactly one worker. This makes counts exact across
-            // threads and avoids rescanning overlap bytes that cannot contribute to
-            // additional matching lines.
+            // Keep matching lines, word boundaries and non-overlapping -o
+            // matches owned by a single worker.
             size_t chunk_end = chunk_start + this_chunk_len;
             if (chunk_end > file_size)
                 chunk_end = file_size;
@@ -4484,7 +4499,8 @@ static int search_directory_recursive_impl(const char *base_dir, const search_pa
     char path_buffer[PATH_MAX]; // Buffer to construct full paths
 
     // Read directory entries one by one
-    while ((entry = readdir(dir)) != NULL)
+    while ((!quiet_mode || !atomic_load(&global_match_found_flag)) &&
+           (entry = readdir(dir)) != NULL)
     {
         // Skip "." and ".." entries
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
@@ -4842,10 +4858,12 @@ int main(int argc, char *argv[])
 
         case 'v': // Version
             printf("krep v%s\n", VERSION);
-#if KREP_USE_AVX2
+#if KREP_USE_AVX512
+            printf("SIMD: Compiled with AVX-512 support.\n");
+#elif KREP_USE_AVX2
             printf("SIMD: Compiled with AVX2 support.\n");
 #elif KREP_USE_SSE42
-            printf("SIMD: Compiled with SSE4.2 support.\n");
+            printf("SIMD: Compiled with SSE2 support.\n");
 #elif KREP_USE_NEON
             printf("SIMD: Compiled with NEON support.\n");
 #else
@@ -5771,786 +5789,147 @@ uint64_t memchr_short_search(const search_params_t *params,
     return current_count;
 }
 
-#ifdef __ARM_NEON
-// NEON search function — optimised for 32-byte wide processing.
-// Handles case-sensitive patterns of any length.
-// Uses 2x 16-byte loads per iteration with fast mask extraction via
-// vshrn/vmovn instead of store-to-memory.
-uint64_t neon_search(const search_params_t *params,
-                     const char *text_start,
-                     size_t text_len,
-                     match_result_t *result)
+#if KREP_USE_NEON || KREP_USE_SSE42 || KREP_USE_AVX2 || KREP_USE_AVX512
+// Compare two pattern bytes across a vector of candidate start positions.
+// Only candidates passing both filters reach memcmp. Every vector load and
+// verification is bounded by the number of complete patterns still available.
+static HOT_FUNCTION uint64_t simd_literal_search(const search_params_t *params,
+                                                 const char *text, size_t text_len,
+                                                 match_result_t *result)
 {
-    // Precondition checks
-    if (params->pattern_len == 0 || !params->case_sensitive || text_len < params->pattern_len)
-    {
-        return boyer_moore_search(params, text_start, text_len, result);
-    }
-    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
+    const size_t length = params->pattern_len;
+    if (params->max_count == 0 || length == 0 || text_len < length)
         return 0;
+    if (!params->case_sensitive)
+        return boyer_moore_search(params, text, text_len, result);
 
-    uint64_t current_count = 0;
-    size_t pattern_len = params->pattern_len;
     const char *pattern = params->pattern;
-    bool count_lines_mode = params->count_lines_mode;
-    bool track_positions = params->track_positions;
-    size_t max_count = params->max_count;
-    size_t last_counted_line_start = SIZE_MAX;
-
-    // Broadcast the first character of the pattern to a 128-bit vector
-    uint8x16_t first_char_vec = vdupq_n_u8((uint8_t)pattern[0]);
-
-    const char *current_pos = text_start;
-    size_t remaining_len = text_len;
-
-    // Process in 32-byte (2×NEON) chunks for better throughput
-    while (remaining_len >= 32)
-    {
-        // Double-distance prefetch
-        if (LIKELY(remaining_len > PREFETCH_DISTANCE_FAR))
-        {
-            __builtin_prefetch(current_pos + PREFETCH_DISTANCE, 0, 0);
-            __builtin_prefetch(current_pos + PREFETCH_DISTANCE_FAR, 0, 0);
-        }
-
-        // Load two 16-byte NEON registers
-        uint8x16_t text_vec0 = vld1q_u8((const uint8_t *)current_pos);
-        uint8x16_t text_vec1 = vld1q_u8((const uint8_t *)(current_pos + 16));
-
-        // Compare with first character
-        uint8x16_t cmp0 = vceqq_u8(text_vec0, first_char_vec);
-        uint8x16_t cmp1 = vceqq_u8(text_vec1, first_char_vec);
-
-        // Extract 16-bit mask: store comparison results and build bitmask manually.
-        // This is faster than vmaxvq_u8 + iteration on Apple Silicon.
-        uint8_t match_buf[32] __attribute__((aligned(16)));
-        vst1q_u8(match_buf, cmp0);
-        vst1q_u8(match_buf + 16, cmp1);
-
-        uint32_t match_mask32 = 0;
-        // Pack 32 bytes into a 32-bit mask (bit i = 1 if match_buf[i] != 0)
-        for (int k = 0; k < 32; k++) {
-            if (match_buf[k] != 0)
-                match_mask32 |= (1u << k);
-        }
-
-        if (match_mask32 != 0)
-        {
-            // Iterate over set bits
-            for (int lane = 0; lane < 32 && match_mask32 != 0; lane++)
-            {
-                if (match_mask32 & 1u)
-                {
-                    // Verify bounds
-                    if (remaining_len - lane < pattern_len)
-                    {
-                        match_mask32 >>= 1;
-                        continue;
-                    }
-                    // Verify full pattern match
-                    if (memcmp(current_pos + lane, pattern, pattern_len) == 0)
-                    {
-                        size_t match_start_offset = (current_pos - text_start) + lane;
-
-                        // Whole word check
-                        if (params->whole_word &&
-                            !is_whole_word_match(text_start, text_len, match_start_offset,
-                                                match_start_offset + pattern_len))
-                        {
-                            match_mask32 >>= 1;
-                            continue;
-                        }
-
-                        bool count_incremented_this_match = false;
-
-                        if (count_lines_mode)
-                        {
-                            size_t line_start = find_line_start(text_start, text_len, match_start_offset);
-                            if (line_start != last_counted_line_start)
-                            {
-                                if (current_count >= max_count) goto end_neon_search;
-                                current_count++;
-                                last_counted_line_start = line_start;
-                                count_incremented_this_match = true;
-
-                                // Skip to end of this line
-                                size_t line_end = find_line_end(text_start, text_len, line_start);
-                                if (line_end < text_len)
-                                {
-                                    size_t next_line_start = line_end + 1;
-                                    size_t current_offset = current_pos - text_start;
-
-                                    if (next_line_start > current_offset)
-                                    {
-                                        size_t advance = next_line_start - current_offset;
-                                        if (advance > remaining_len) advance = remaining_len;
-                                        current_pos += advance;
-                                        remaining_len -= advance;
-                                        goto next_chunk_neon;
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            if (current_count >= max_count) goto end_neon_search;
-                            current_count++;
-                            count_incremented_this_match = true;
-
-                            if (track_positions && result)
-                            {
-                                if (current_count <= max_count)
-                                {
-                                    if (!match_result_add(result, match_start_offset,
-                                                         match_start_offset + pattern_len))
-                                    {
-                                        fprintf(stderr, "Warning: Failed to add NEON match position.\n");
-                                    }
-                                }
-                            }
-                        }
-
-                        if (count_incremented_this_match && current_count >= max_count)
-                            goto end_neon_search;
-                    }
-                }
-                match_mask32 >>= 1;
-            }
-        }
-
-        current_pos += 32;
-        remaining_len -= 32;
-    next_chunk_neon:;
-    }
-
-    // Handle tail with Boyer-Moore
-    if (remaining_len >= pattern_len)
-    {
-        search_params_t tail_params = *params;
-        if (max_count != SIZE_MAX)
-            tail_params.max_count = (current_count >= max_count) ? 0 : max_count - current_count;
-
-        uint64_t tail_count = boyer_moore_search(&tail_params, current_pos, remaining_len, result);
-
-        if (result && track_positions && tail_count > 0)
-        {
-            size_t tail_offset = current_pos - text_start;
-            size_t start_idx = result->count - tail_count;
-            if (result->count >= tail_count)
-            {
-                for (size_t k = 0; k < tail_count; ++k)
-                {
-                    result->positions[start_idx + k].start_offset += tail_offset;
-                    result->positions[start_idx + k].end_offset += tail_offset;
-                }
-            }
-        }
-        current_count += tail_count;
-    }
-
-end_neon_search:
-    return current_count;
-}
-#endif
-
-// --- SIMD Implementations (Placeholders/Actual) ---
-
-#if KREP_USE_SSE42
-// SSE4.2 search function using _mm_cmpestri
-// Handles case-sensitive patterns up to 16 bytes.
-uint64_t simd_sse42_search(const search_params_t *params,
-                           const char *text_start,
-                           size_t text_len,
-                           match_result_t *result)
-{
-    // Precondition checks
-    if (params->pattern_len == 0 || params->pattern_len > 16 || !params->case_sensitive || text_len < params->pattern_len)
-    {
-        // Fallback if preconditions not met
-        return boyer_moore_search(params, text_start, text_len, result);
-    }
-    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
-        return 0;
-
-    uint64_t current_count = 0;
-    size_t pattern_len = params->pattern_len;
-    const char *pattern = params->pattern;
-    bool count_lines_mode = params->count_lines_mode;
-    bool track_positions = params->track_positions;
-    size_t max_count = params->max_count;
-    size_t last_counted_line_start = SIZE_MAX;
-
-    // Avoid reading beyond a short pattern's strlen()+1 allocation.
-    __m128i pattern_vec;
-    if (pattern_len < sizeof(pattern_vec))
-    {
-        char safe_pattern[sizeof(pattern_vec)] = {0};
-        memcpy(safe_pattern, pattern, pattern_len);
-        pattern_vec = _mm_loadu_si128((const __m128i *)safe_pattern);
-    }
-    else
-    {
-        pattern_vec = _mm_loadu_si128((const __m128i *)pattern);
-    }
-
-    const char *current_pos = text_start;
-    size_t remaining_len = text_len;
-
-    // Mode for _mm_cmpestri: compare strings, return index, positive polarity
-    // Using an enum for constant folding to work with optimizations off
-    enum
-    {
-        cmp_mode = _SIDD_CMP_EQUAL_ORDERED | _SIDD_POSITIVE_POLARITY | _SIDD_LEAST_SIGNIFICANT
-    };
-
-    while (remaining_len >= pattern_len)
-    {
-        // Determine chunk size (max 16 bytes for _mm_cmpestri)
-        size_t chunk_len = (remaining_len < 16) ? remaining_len : 16;
-
-        // Load text chunk into an XMM register - SAFELY
-        __m128i text_vec;
-        if (chunk_len < 16)
-        {
-            // For smaller chunks, use a buffer to avoid reading past the end
-            char safe_buffer[16] = {0}; // Zero-initialized
-            memcpy(safe_buffer, current_pos, chunk_len);
-            text_vec = _mm_loadu_si128((const __m128i *)safe_buffer);
-        }
-        else
-        {
-            text_vec = _mm_loadu_si128((const __m128i *)current_pos);
-        }
-
-        // Compare pattern against the text chunk
-        // _mm_cmpestri returns the index of the first byte of the first match
-        // or chunk_len if no match is found within the chunk.
-        int index = _mm_cmpestri(pattern_vec, pattern_len, text_vec, chunk_len, cmp_mode);
-
-        if (index < (int)(chunk_len - pattern_len + 1))
-        {
-            // Match found within the current 16-byte window at 'index'
-            size_t match_start_offset = (current_pos - text_start) + index;
-
-            // Fast path: skip whole word check if not needed
-            if (!params->whole_word || is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
-            {
-                bool count_incremented_this_match = false;
-
-                if (count_lines_mode)
-                {
-                    // Cache the line start position to avoid repeated calculations
-                    size_t line_start = find_line_start(text_start, text_len, match_start_offset);
-                    if (line_start != last_counted_line_start)
-                    {
-                        // Check max count before incrementing
-                        if (current_count >= max_count)
-                            break;
-
-                        current_count++;
-                        last_counted_line_start = line_start;
-                        count_incremented_this_match = true;
-
-                        // Optimize: advance to next line after counting this one
-                        size_t line_end = find_line_end(text_start, text_len, line_start);
-                        if (line_end < text_len)
-                        {
-                            // Convert to offsets from text_start to fix pointer arithmetic
-                            size_t current_offset = (current_pos - text_start) + index;
-                            size_t advance = (line_end + 1) - current_offset;
-                            if (advance > 0)
-                            {
-                                current_pos += advance;
-                                remaining_len -= advance;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    // Check max count before incrementing
-                    if (current_count >= max_count)
-                        break;
-
-                    current_count++;
-                    count_incremented_this_match = true;
-
-                    if (track_positions && result)
-                    {
-                        // Add position only if still within max_count
-                        if (current_count <= max_count)
-                        {
-                            // Minimize error checking in tight loop for better performance
-                            if (result->count < result->capacity)
-                            {
-                                result->positions[result->count].start_offset = match_start_offset;
-                                result->positions[result->count].end_offset = match_start_offset + pattern_len;
-                                result->count++;
-                            }
-                            else if (!match_result_add(result, match_start_offset, match_start_offset + pattern_len))
-                            {
-                                fprintf(stderr, "Warning: Failed to add SSE4.2 match position.\n");
-                            }
-                        }
-                    }
-                }
-
-                // Early break if max count reached
-                if (count_incremented_this_match && current_count >= max_count)
-                {
-                    break;
-                }
-            }
-
-            // More aggressive advancement strategy
-            // Advance to just after the match instead of just by one byte
-            size_t advance = index + 1;
-
-            // If not looking for overlapping matches, can advance by pattern length
-            if (!only_matching)
-            { // only_matching mode needs to find overlapping matches
-                advance = index + pattern_len;
-                // Ensure we don't advance too far if near end
-                if (advance > remaining_len)
-                    advance = remaining_len;
-            }
-
-            current_pos += advance;
-            remaining_len -= advance;
-        }
-        else
-        {
-            // No match found in this chunk. Advance more aggressively.
-            // Jump by almost the full chunk size, leaving just enough overlap
-            // for potential matches that span chunk boundaries.
-            size_t advance = chunk_len > pattern_len ? chunk_len - pattern_len + 1 : 1;
-            // Ensure we don't advance beyond text bounds
-            if (advance > remaining_len)
-                advance = remaining_len;
-
-            current_pos += advance;
-            remaining_len -= advance;
-        }
-    }
-
-    return current_count;
-}
-#endif
-
-#if KREP_USE_AVX2
-// AVX2 search function
-// Handles case-sensitive patterns up to 32 bytes.
-// Uses SSE4.2 logic for patterns <= 16 bytes.
-// Uses a simplified first/last byte check for patterns > 16 bytes.
-uint64_t simd_avx2_search(const search_params_t *params,
-                          const char *text_start,
-                          size_t text_len,
-                          match_result_t *result)
-{
-    // Precondition checks
-    if (params->pattern_len == 0 || params->pattern_len > 32 || !params->case_sensitive || text_len < params->pattern_len)
-    {
-        return boyer_moore_search(params, text_start, text_len, result);
-    }
-    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
-        return 0;
-
-    // Use SSE4.2 logic if pattern fits and SSE4.2 is available
-#if KREP_USE_SSE42
-    if (params->pattern_len <= 16)
-    {
-        return simd_sse42_search(params, text_start, text_len, result);
-    }
-#endif
-
-    // --- AVX2 specific logic for pattern_len > 16 and <= 32 ---
-    uint64_t current_count = 0;
-    size_t pattern_len = params->pattern_len;
-    const char *pattern = params->pattern;
-    bool count_lines_mode = params->count_lines_mode;
-    bool track_positions = params->track_positions;
-    size_t max_count = params->max_count;
-    size_t last_counted_line_start = SIZE_MAX;
-
-    // Create vectors for the first and last bytes of the pattern
-    __m256i first_byte_vec = _mm256_set1_epi8(pattern[0]);
-    __m256i last_byte_vec = _mm256_set1_epi8(pattern[pattern_len - 1]);
-
-    const char *current_pos = text_start;
-    size_t remaining_len = text_len;
-
-    while (remaining_len >= 32) // Process in 32-byte chunks
-    {
-        bool line_skipped = false;
-        // Prefetch next cache lines for better memory performance
-        if (LIKELY(remaining_len > PREFETCH_DISTANCE))
-            __builtin_prefetch(current_pos + PREFETCH_DISTANCE, 0, 0);
-
-        // Load 32 bytes of text - SAFELY
-        __m256i text_vec;
-        if (remaining_len < 32)
-        {
-            // For smaller chunks, use a buffer to avoid reading past the end
-            char safe_buffer[32] = {0}; // Zero-initialized
-            memcpy(safe_buffer, current_pos, remaining_len);
-            text_vec = _mm256_loadu_si256((const __m256i *)safe_buffer);
-        }
-        else
-        {
-            text_vec = _mm256_loadu_si256((const __m256i *)current_pos);
-        }
-
-        // Compare first byte of pattern with text
-        __m256i first_cmp = _mm256_cmpeq_epi8(first_byte_vec, text_vec);
-
-        // Compare last byte of pattern with text shifted by pattern_len - 1
-        // This requires loading potentially unaligned data for the last byte comparison
-        // SAFELY handle this load too
-        __m256i text_last_byte_vec;
-        size_t last_byte_offset = pattern_len - 1;
-        size_t bytes_available = remaining_len > last_byte_offset ? remaining_len - last_byte_offset : 0;
-
-        if (bytes_available < 32)
-        {
-            char safe_buffer[32] = {0}; // Zero-initialized
-            size_t copy_size = bytes_available < remaining_len ? bytes_available : remaining_len;
-            memcpy(safe_buffer, current_pos + last_byte_offset, copy_size);
-            text_last_byte_vec = _mm256_loadu_si256((const __m256i *)safe_buffer);
-        }
-        else
-        {
-            text_last_byte_vec = _mm256_loadu_si256((const __m256i *)(current_pos + last_byte_offset));
-        }
-        __m256i last_cmp = _mm256_cmpeq_epi8(last_byte_vec, text_last_byte_vec);
-
-        // Combine the masks: a potential match starts where both first and last bytes match
-        // Note: _mm256_and_si256 operates on the comparison results directly
-        // We need the mask of indices where *both* comparisons are true.
-        // Get integer masks
-        uint32_t first_mask = _mm256_movemask_epi8(first_cmp);
-        // The last_mask needs to correspond to the *start* position of the potential match
-        uint32_t last_mask = _mm256_movemask_epi8(last_cmp);
-
-        // Combine masks: potential match starts at index 'i' if bit 'i' is set in both masks.
-        uint32_t potential_starts_mask = first_mask & last_mask;
-
-        // Iterate through potential start positions indicated by the combined mask
-        while (potential_starts_mask != 0)
-        {
-            // Find the index of the lowest set bit (potential match start)
-            int index = __builtin_ctz(potential_starts_mask); // Use compiler intrinsic for count trailing zeros
-
-            // Verify the full pattern match at this position
-            if (memcmp(current_pos + index, pattern, pattern_len) == 0)
-            {
-                // Full match confirmed
-                size_t match_start_offset = (current_pos - text_start) + index;
-                // Whole word check
-                if (params->whole_word && !is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
-                {
-                    potential_starts_mask &= potential_starts_mask - 1;
-                    continue;
-                }
-
-                bool count_incremented_this_match = false;
-
-                if (count_lines_mode)
-                {
-                    size_t line_start = find_line_start(text_start, text_len, match_start_offset);
-                    if (line_start != last_counted_line_start)
-                    {
-                        current_count++;
-                        last_counted_line_start = line_start;
-                        count_incremented_this_match = true;
-
-                        if (current_count >= max_count)
-                        {
-                            goto end_avx2_search;
-                        }
-
-                        // Optimization: skip to next line for -c mode
-                        size_t line_end = find_line_end(text_start, text_len, line_start);
-                        size_t next_line_start = (line_end < text_len) ? line_end + 1 : text_len;
-                        size_t current_offset = (size_t)(current_pos - text_start);
-                        if (next_line_start > current_offset)
-                        {
-                            size_t advance = next_line_start - current_offset;
-                            if (advance > remaining_len)
-                                advance = remaining_len;
-                            current_pos += advance;
-                            remaining_len -= advance;
-                            line_skipped = true;
-                            break;
-                        }
-                    }
-                }
-                else
-                {
-                    current_count++;
-                    count_incremented_this_match = true;
-                    if (track_positions && result)
-                    {
-                        if (current_count <= max_count)
-                        {
-                            if (!match_result_add(result, match_start_offset, match_start_offset + pattern_len))
-                            {
-                                fprintf(stderr, "Warning: Failed to add AVX2 match position.\n");
-                            }
-                        }
-                    }
-                }
-
-                // Check max_count limit
-                if (count_incremented_this_match && current_count >= max_count)
-                {
-                    goto end_avx2_search; // Exit outer loop
-                }
-            }
-
-            // Clear the found bit to find the next potential start
-            potential_starts_mask &= potential_starts_mask - 1;
-        }
-
-        if (line_skipped)
-        {
-            continue;
-        }
-
-        // Advance position. Advance by 32 for simplicity, might miss overlaps near boundary.
-        // A safer advance would be smaller, e.g., 1 or based on last potential match.
-        // For this basic version, we advance by 32.
-        current_pos += 32;
-        remaining_len -= 32;
-    }
-
-    // Handle the remaining tail (less than 32 bytes) using scalar search
-    if (remaining_len >= pattern_len)
-    {
-        // Create a temporary params struct for the tail search
-        search_params_t tail_params = *params;
-        // Adjust max_count for the remaining part
-        if (max_count != SIZE_MAX)
-        {
-            tail_params.max_count = (current_count >= max_count) ? 0 : max_count - current_count;
-        }
-
-        // Use Boyer-Moore for the tail
-        uint64_t tail_count = boyer_moore_search(&tail_params, current_pos, remaining_len, result);
-
-        // Adjust global count and potentially merge results (BM adds directly if result is passed)
-        // Need to adjust offsets if result was passed to BM
-        if (result && track_positions && tail_count > 0)
-        {
-            // Find where the tail results start in the global result list
-            uint64_t bm_start_index = current_count; // Assuming BM added sequentially
-            if (bm_start_index > result->count)
-                bm_start_index = result->count; // Safety check
-            uint64_t added_by_bm = result->count - bm_start_index;
-
-            size_t tail_offset = current_pos - text_start;
-            for (uint64_t k = 0; k < added_by_bm; ++k)
-            {
-                result->positions[bm_start_index + k].start_offset += tail_offset;
-                result->positions[bm_start_index + k].end_offset += tail_offset;
-            }
-        }
-        current_count += tail_count;
-        // Ensure final count doesn't exceed max_count
-        if (max_count != SIZE_MAX && current_count > max_count)
-        {
-            current_count = max_count;
-            // Note: Result list might have slightly more entries than max_count here,
-            // but print_matching_items respects max_count.
-        }
-    }
-
-end_avx2_search:
-    return current_count;
-}
-#endif
+    size_t probe = length - 1;
+    // Prefer a different byte when the first and last bytes are identical.
+    while (probe > 1 && pattern[probe] == pattern[0])
+        --probe;
+    const size_t limit = text_len - length + 1;
+    size_t pos = 0;
+    uint64_t count = 0;
 
 #if KREP_USE_AVX512
-// AVX-512 search function - Ultra high-performance search for 64-byte patterns
-// Uses 512-bit registers for maximum throughput on supported hardware
-HOT_FUNCTION
-uint64_t simd_avx512_search(const search_params_t *params,
-                            const char *text_start,
-                            size_t text_len,
-                            match_result_t *result)
-{
-    // Precondition checks
-    if (UNLIKELY(params->pattern_len == 0 || params->pattern_len > 64 || 
-                 !params->case_sensitive || text_len < params->pattern_len))
+    const size_t width = 64;
+    const __m512i first = _mm512_set1_epi8(pattern[0]);
+    const __m512i second = _mm512_set1_epi8(pattern[probe]);
+#elif KREP_USE_AVX2
+    const size_t width = 32;
+    const __m256i first = _mm256_set1_epi8(pattern[0]);
+    const __m256i second = _mm256_set1_epi8(pattern[probe]);
+#elif KREP_USE_SSE42
+    const size_t width = 16;
+    const __m128i first = _mm_set1_epi8(pattern[0]);
+    const __m128i second = _mm_set1_epi8(pattern[probe]);
+#else
+    const size_t width = 16;
+    const uint8x16_t first = vdupq_n_u8((uint8_t)pattern[0]);
+    const uint8x16_t second = vdupq_n_u8((uint8_t)pattern[probe]);
+    const uint8_t bit_weights[16] = {1, 2, 4, 8, 16, 32, 64, 128,
+                                    1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t weights = vld1q_u8(bit_weights);
+#endif
+
+    while (pos < limit && limit - pos >= width)
     {
-        return simd_avx2_search(params, text_start, text_len, result);
-    }
-    if (UNLIKELY(params->max_count == 0 && (params->count_lines_mode || params->track_positions)))
-        return 0;
-
-    // Use AVX2 for smaller patterns (more efficient)
-    if (params->pattern_len <= 32)
-    {
-        return simd_avx2_search(params, text_start, text_len, result);
-    }
-
-    // --- AVX-512 specific logic for pattern_len > 32 and <= 64 ---
-    uint64_t current_count = 0;
-    const size_t pattern_len = params->pattern_len;
-    const char *pattern = params->pattern;
-    const bool count_lines_mode = params->count_lines_mode;
-    const bool track_positions = params->track_positions;
-    const size_t max_count = params->max_count;
-    size_t last_counted_line_start = SIZE_MAX;
-
-    // Create 512-bit vectors for the first and last bytes of the pattern
-    const __m512i first_byte_vec = _mm512_set1_epi8(pattern[0]);
-    const __m512i last_byte_vec = _mm512_set1_epi8(pattern[pattern_len - 1]);
-
-    const char *current_pos = text_start;
-    size_t remaining_len = text_len;
-
-    // Process in 64-byte chunks (512 bits)
-    while (remaining_len >= 64)
-    {
-        bool line_skipped = false;
-        // Aggressive prefetching for streaming access
-        if (LIKELY(remaining_len > PREFETCH_DISTANCE * 2))
+        const size_t base = pos;
+        uint64_t mask;
+#if KREP_USE_AVX512
+        mask = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(text + base), first) &
+               _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(text + base + probe), second);
+#elif KREP_USE_AVX2
+        const __m256i a = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(text + base)), first);
+        const __m256i b = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(text + base + probe)), second);
+        mask = (uint32_t)_mm256_movemask_epi8(_mm256_and_si256(a, b));
+#elif KREP_USE_SSE42
+        const __m128i a = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(text + base)), first);
+        const __m128i b = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(text + base + probe)), second);
+        mask = (unsigned)_mm_movemask_epi8(_mm_and_si128(a, b));
+#else
+        const uint8x16_t a = vceqq_u8(vld1q_u8((const uint8_t *)(text + base)), first);
+        const uint8x16_t b = vceqq_u8(vld1q_u8((const uint8_t *)(text + base + probe)), second);
+        const uint8x16_t candidates = vandq_u8(vandq_u8(a, b), weights);
+        const uint64x2_t sums = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(candidates)));
+        mask = vgetq_lane_u64(sums, 0) | (vgetq_lane_u64(sums, 1) << 8);
+#endif
+        while (mask)
         {
-            __builtin_prefetch(current_pos + PREFETCH_DISTANCE, 0, 0);
-            __builtin_prefetch(current_pos + PREFETCH_DISTANCE * 2, 0, 0);
-        }
-
-        // Load 64 bytes of text
-        __m512i text_vec = _mm512_loadu_si512((const __m512i *)current_pos);
-
-        // Compare first byte of pattern with text
-        __mmask64 first_mask = _mm512_cmpeq_epi8_mask(first_byte_vec, text_vec);
-
-        // Quick exit if no first byte matches
-        if (first_mask == 0)
-        {
-            current_pos += 64;
-            remaining_len -= 64;
-            continue;
-        }
-
-        // Load last byte positions (offset by pattern_len - 1)
-        size_t last_byte_offset = pattern_len - 1;
-        if (remaining_len >= last_byte_offset + 64)
-        {
-            __m512i text_last_byte_vec = _mm512_loadu_si512((const __m512i *)(current_pos + last_byte_offset));
-            __mmask64 last_mask = _mm512_cmpeq_epi8_mask(last_byte_vec, text_last_byte_vec);
-
-            // Combine masks: potential match starts where both first and last bytes match
-            uint64_t potential_starts_mask = first_mask & last_mask;
-
-            // Process all potential matches
-            while (potential_starts_mask != 0)
-            {
-                // Find the index of the lowest set bit
-                int index = __builtin_ctzll(potential_starts_mask);
-
-                // Verify full pattern match
-                if (memcmp(current_pos + index, pattern, pattern_len) == 0)
-                {
-                    size_t match_start_offset = (current_pos - text_start) + index;
-
-                    // Whole word check
-                    if (params->whole_word && 
-                        !is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
-                    {
-                        potential_starts_mask &= potential_starts_mask - 1;
-                        continue;
-                    }
-
-                    bool count_incremented = false;
-
-                    if (count_lines_mode)
-                    {
-                        size_t line_start = find_line_start(text_start, text_len, match_start_offset);
-                        if (line_start != last_counted_line_start)
-                        {
-                            current_count++;
-                            last_counted_line_start = line_start;
-                            count_incremented = true;
-
-                            if (current_count >= max_count)
-                            {
-                                return current_count;
-                            }
-
-                            // Optimization: skip to the next line for -c mode
-                            size_t line_end = find_line_end(text_start, text_len, line_start);
-                            size_t next_line_start = (line_end < text_len) ? line_end + 1 : text_len;
-                            size_t current_offset = (size_t)(current_pos - text_start);
-                            if (next_line_start > current_offset)
-                            {
-                                size_t advance = next_line_start - current_offset;
-                                if (advance > remaining_len)
-                                    advance = remaining_len;
-                                current_pos += advance;
-                                remaining_len -= advance;
-                                line_skipped = true;
-                                break;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        current_count++;
-                        count_incremented = true;
-                        if (track_positions && result && current_count <= max_count)
-                        {
-                            match_result_add(result, match_start_offset, match_start_offset + pattern_len);
-                        }
-                    }
-
-                    if (count_incremented && current_count >= max_count)
-                    {
-                        return current_count;
-                    }
-                }
-
-                potential_starts_mask &= potential_starts_mask - 1;
-            }
-
-            if (line_skipped)
-            {
+            const size_t offset = base + (size_t)__builtin_ctzll(mask);
+            mask &= mask - 1;
+            if (offset < pos || memcmp(text + offset, pattern, length) != 0)
                 continue;
-            }
-        }
+            if (params->whole_word && !is_whole_word_match(text, text_len, offset, offset + length))
+                continue;
 
-        current_pos += 64;
-        remaining_len -= 64;
-    }
-
-    // Handle tail with AVX2
-    if (remaining_len >= pattern_len)
-    {
-        search_params_t tail_params = *params;
-        if (max_count != SIZE_MAX)
-        {
-            tail_params.max_count = (current_count >= max_count) ? 0 : max_count - current_count;
-        }
-
-        uint64_t tail_count = simd_avx2_search(&tail_params, current_pos, remaining_len, result);
-
-        // Fix offsets for tail matches
-        if (result && track_positions && tail_count > 0)
-        {
-            size_t tail_offset = current_pos - text_start;
-            uint64_t start_idx = result->count >= tail_count ? result->count - tail_count : 0;
-            for (uint64_t k = 0; k < tail_count && (start_idx + k) < result->count; ++k)
+            ++count;
+            if (!params->count_lines_mode && params->track_positions && result)
+                match_result_add(result, offset, offset + length);
+            if (count >= params->max_count)
+                return count;
+            if (params->count_lines_mode)
             {
-                result->positions[start_idx + k].start_offset += tail_offset;
-                result->positions[start_idx + k].end_offset += tail_offset;
+                // No backward line scan: all earlier matching lines were skipped.
+                pos = advance_to_next_line_boundary(text, text_len, offset);
+                goto next_vector;
             }
+            pos = offset + (only_matching ? length : 1);
         }
-
-        current_count += tail_count;
+        if (pos < base + width)
+            pos = base + width;
+    next_vector:;
     }
 
-    return current_count;
+    // Keep the original buffer for the tail so whole-word checks can inspect
+    // the preceding byte, and count mode cannot count the same line twice.
+    while (pos < limit)
+    {
+        if (text[pos] == pattern[0] && text[pos + probe] == pattern[probe] &&
+            memcmp(text + pos, pattern, length) == 0 &&
+            (!params->whole_word || is_whole_word_match(text, text_len, pos, pos + length)))
+        {
+            ++count;
+            if (!params->count_lines_mode && params->track_positions && result)
+                match_result_add(result, pos, pos + length);
+            if (count >= params->max_count)
+                break;
+            if (params->count_lines_mode)
+                pos = advance_to_next_line_boundary(text, text_len, pos);
+            else
+                pos += only_matching ? length : 1;
+        }
+        else
+            ++pos;
+    }
+    return count;
+}
+#endif
+
+// Retain the algorithm entry points for library callers and tests. The build
+// selects the widest enabled vector implementation above.
+#if KREP_USE_NEON
+uint64_t neon_search(const search_params_t *p, const char *t, size_t n, match_result_t *r)
+{
+    return simd_literal_search(p, t, n, r);
+}
+#endif
+#if KREP_USE_SSE42
+uint64_t simd_sse42_search(const search_params_t *p, const char *t, size_t n, match_result_t *r)
+{
+    return simd_literal_search(p, t, n, r);
+}
+#endif
+#if KREP_USE_AVX2
+uint64_t simd_avx2_search(const search_params_t *p, const char *t, size_t n, match_result_t *r)
+{
+    return simd_literal_search(p, t, n, r);
+}
+#endif
+#if KREP_USE_AVX512
+uint64_t simd_avx512_search(const search_params_t *p, const char *t, size_t n, match_result_t *r)
+{
+    return simd_literal_search(p, t, n, r);
 }
 #endif

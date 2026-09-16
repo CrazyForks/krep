@@ -31,6 +31,7 @@
 void run_regex_tests(void);
 // Forward declaration for multiple pattern tests (defined in test_multiple_patterns.c)
 void run_multiple_patterns_tests(void);
+void run_simd_regression_tests(void);
 
 /* Test flags and counters */
 int tests_passed = 0;
@@ -1644,6 +1645,7 @@ int main(void)
     // Run tests from other files
     run_regex_tests();
     run_multiple_patterns_tests();
+    run_simd_regression_tests();
 
     // Run advanced edge cases
     test_edge_cases_advanced();

@@ -22,48 +22,20 @@ jobs:
             artifact: krep-macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
-      - name: Build
-        run: make -j
+      - name: Build portable binaries and run all tests
+        run: make -j2 PORTABLE=1 ci
 
-      - name: Run tests
-        run: make test && make test-directory && make test-cli
-
-      - name: Ensure ripgrep is available
-        shell: bash
-        run: |
-          if command -v rg >/dev/null 2>&1; then
-            exit 0
-          fi
-
-          case "${RUNNER_OS}" in
-            Linux)
-              sudo apt-get update
-              sudo apt-get install -y ripgrep
-              ;;
-            macOS)
-              brew install ripgrep
-              ;;
-            *)
-              echo "Unsupported runner OS: ${RUNNER_OS}" >&2
-              exit 1
-              ;;
-          esac
-
-      - name: Benchmark smoke test
-        shell: bash
-        run: |
-          curl -LO 'https://burntsushi.net/stuff/subtitles2016-sample.en.gz'
-          gzip -dkf subtitles2016-sample.en.gz
-          RUNS=1 bash test/benchmark_krep_vs_rg.sh Sherlock
+      - name: Offline benchmark smoke test
+        run: python3 test/benchmark_release.py --runs 1 --size-mib 2 --output-lines 128
 
       - name: Package binary
         run: |
           mkdir -p dist
-          cp krep dist/
+          cp krep LICENSE README.md CHANGELOG.md dist/
           cd dist
-          tar czf ${{ matrix.artifact }}.tar.gz krep
+          tar czf ${{ matrix.artifact }}.tar.gz krep LICENSE README.md CHANGELOG.md
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Upload artifact
@@ -76,7 +48,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -87,17 +59,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Collect all tarballs and checksums
-          FILES=""
-          for dir in artifacts/*/; do
-            for f in "$dir"*.tar.gz "$dir"*.sha256; do
-              [ -f "$f" ] && FILES="$FILES $f"
-            done
-          done
-
-          # Create release if it doesn't exist, then upload assets
-          gh release create "${{ github.ref_name }}" \
-            --title "krep ${{ github.ref_name }}" \
-            --generate-notes \
-            $FILES 2>/dev/null \
-          || gh release upload "${{ github.ref_name }}" $FILES --clobber
+          python3 - <<'PYNOTES' > release-notes.md
+          from pathlib import Path
+          import os
+          version = os.environ['GITHUB_REF_NAME'].removeprefix('v')
+          changelog = Path('CHANGELOG.md').read_text()
+          section = changelog.split(f'## [{version}]', 1)[1].split('\n## [', 1)[0]
+          print(section.split('\n', 1)[1].strip())
+          PYNOTES
+          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) | sort)
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" "${files[@]}" --clobber
+          else
+            gh release create "${{ github.ref_name }}" \
+              --verify-tag --title "krep ${{ github.ref_name }}" \
+              --notes-file release-notes.md "${files[@]}"
+          fi

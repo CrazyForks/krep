@@ -6,3 +6,5 @@ krep_test
 test_directory
 *.o
 test/*.o
+*.dSYM/
+__pycache__/
